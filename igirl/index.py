@@ -20,6 +20,8 @@ from .node import stamp
 
 TTL = 6 * 3600
 MAX_ENTRIES = 5000
+ANNOUNCE_EVERY = 20       # seconds between announces from one girl
+GIRLS_PER_ADDRESS = 32    # one household can't flood the directory with fresh keys
 
 
 class Index:
@@ -30,6 +32,7 @@ class Index:
             self.girls: dict[str, dict] = json.loads(state.read_text())
         except (OSError, json.JSONDecodeError):
             self.girls = {}
+        self.last_announce: dict[str, float] = {}
 
     def log(self, msg):
         print(f"[{stamp()}] {msg}", flush=True)
@@ -43,6 +46,17 @@ class Index:
                             "proto": "gossip/1"}}
 
     async def h_announce(self, req, host):
+        now = time.time()
+        pub = str((req.get("from") or {}).get("pub"))
+        key = f"{host}|{pub}"
+        if now - self.last_announce.get(key, 0) < ANNOUNCE_EVERY:
+            raise protocol.GossipError("announcing too often — once every few minutes is plenty")
+        self.last_announce[key] = now
+        if len(self.last_announce) > 10000:
+            self.last_announce = {k: t for k, t in self.last_announce.items() if now - t < 3600}
+        same_ip = [g for g in self.live() if g["host"] == host and g["pub"] != pub]
+        if len(same_ip) >= GIRLS_PER_ADDRESS:
+            raise protocol.GossipError(f"this address already has {len(same_ip)} girls listed")
         prof = await protocol.verify_signed(req, "ANNOUNCE", host)
         new = prof["pub"] not in self.girls
         self.girls[prof["pub"]] = {"pub": prof["pub"], "name": str(prof.get("name", "?"))[:24],
@@ -63,7 +77,9 @@ class Index:
         return {"entries": [{"path": "/index.md", "type": "text/markdown", "size": 0, "updated": int(time.time())}]}
 
     async def h_fetch(self, req, host):
-        rows = "\n".join(f"- **{g['name']}** — `{g['host']}:{g['port']}` — {g['tagline']}" for g in self.live())
+        def addr(g):
+            return f"[{g['host']}]:{g['port']}" if ":" in g["host"] else f"{g['host']}:{g['port']}"
+        rows = "\n".join(f"- [**{g['name']}**](gossip://{addr(g)}/) — {g['tagline']}" for g in self.live())
         return {"path": "/index.md", "type": "text/markdown",
                 "text": f"# 📇 {self.name}\n\nGirls seen in the last {TTL // 3600} hours:\n\n{rows or '(nobody yet)'}\n"}
 

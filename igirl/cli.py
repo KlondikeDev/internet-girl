@@ -17,7 +17,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import protocol, site
-from .config import (DEFAULT_HOME, INDEX_PORT, Girl, is_installed, list_girls,
+from .config import (DEFAULT_HOME, INDEX_PORT, PUBLIC_INDEX, Girl, is_installed, list_girls,
                      load_config, port_free, save_config)
 from .friends import FriendBook, tier
 
@@ -39,6 +39,12 @@ def cmd_install(a):
     path = Path(home).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     cfg["home"] = str(path)
+    if PUBLIC_INDEX not in cfg["indexes"] and not a.home:
+        console.print(f"\nThe public Gossip index at [bold]{PUBLIC_INDEX}[/] lets girls from everywhere find each other.\n"
+                      "[dim]Your girls' names, taglines and public address get listed there. For others to visit them,\n"
+                      "their port must be reachable (forward it on your router if you're at home).[/]")
+        if console.input("Join it? [Y/n] ").strip().lower() in ("", "y", "yes"):
+            cfg["indexes"].append(PUBLIC_INDEX)
     save_config(cfg)
     console.print(f"💕 Girls will live in [bold]{path}[/]. Next: [bold]igirl create[/]")
 

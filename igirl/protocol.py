@@ -129,12 +129,28 @@ def decode_fetch(resp: dict) -> bytes:
 class Server:
     """Frame-level server. `handlers` maps VERB -> async fn(request, peer_host) -> dict."""
 
+    MAX_PER_IP = 16       # concurrent connections from one address
+    MAX_TOTAL = 512
+
     def __init__(self, handlers: dict, log=print):
         self.handlers = handlers
         self.log = log
+        self.active: dict[str, int] = {}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer_host = (writer.get_extra_info("peername") or ("?",))[0]
+        if self.active.get(peer_host, 0) >= self.MAX_PER_IP or sum(self.active.values()) >= self.MAX_TOTAL:
+            writer.close()
+            return
+        self.active[peer_host] = self.active.get(peer_host, 0) + 1
+        try:
+            await self._serve(reader, writer, peer_host)
+        finally:
+            self.active[peer_host] -= 1
+            if not self.active[peer_host]:
+                del self.active[peer_host]
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer_host: str) -> None:
         try:
             magic = await asyncio.wait_for(reader.readexactly(4), TIMEOUT)
             if magic != MAGIC:
@@ -187,7 +203,8 @@ async def verify_signed(req: dict, expect_verb: str, peer_host: str) -> dict:
     try:
         hello = await request(peer_host, port, {"verb": "HELLO"}, timeout=5)
     except GossipError:
-        raise GossipError("couldn't call you back — are you really a girl with a port?") from None
+        raise GossipError(f"couldn't reach you back at {peer_host}:{port} — if you're behind a router, "
+                          f"forward TCP port {port} to this machine") from None
     prof = hello.get("profile", {})
     if prof.get("pub") != frm["pub"]:
         raise GossipError("callback key mismatch")

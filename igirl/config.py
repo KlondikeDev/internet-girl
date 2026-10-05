@@ -37,6 +37,7 @@ DEFAULT_HOME = _home() / ".local" / "share" / "internet-girls"
 DISCOVERY_PORT = 7770
 FIRST_GIRL_PORT = 7771
 INDEX_PORT = 7700
+PUBLIC_INDEX = "index.kunix.org:7700"
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,23}$")
 
