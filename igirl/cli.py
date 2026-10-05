@@ -143,6 +143,11 @@ def cmd_read(a):
     read(a.target, a.path, save=a.save, open_it=a.open, raw=a.raw, show=show)
 
 
+def cmd_browse(a):
+    from .tui.browser import run_browser
+    run_browser(a.target)
+
+
 def cmd_friends(a):
     g = Girl.load(a.name)
     fb = FriendBook(g.path("friends.json"))
@@ -273,6 +278,8 @@ def main(argv=None):
     p.add_argument("--save", metavar="FILE"); p.add_argument("--open", action="store_true")
     p.add_argument("--raw", action="store_true"); p.add_argument("--friends", action="store_true")
     p.add_argument("--peers", action="store_true"); p.set_defaults(fn=cmd_read)
+    p = sp.add_parser("browse", help="the Gossip Browser (read-only)")
+    p.add_argument("target", nargs="?", help="girl name or gossip://host:port/path"); p.set_defaults(fn=cmd_browse)
     p = sp.add_parser("friends", help="her friendbook"); p.add_argument("name"); p.set_defaults(fn=cmd_friends)
     p = sp.add_parser("whispers", help="her girl-to-girl messages"); p.add_argument("name")
     p.add_argument("-n", type=int, default=40); p.set_defaults(fn=cmd_whispers)
