@@ -27,6 +27,12 @@ DECAY_GRACE_DAYS = 3      # no fading for the first few quiet days
 DECAY_PER_DAY = 1.0
 
 
+def addr_of(p: dict) -> str:
+    """How to reach a friendbook entry: host:port, or <pubkey>@relay:port."""
+    from .protocol import join_addr
+    return join_addr(p.get("host", "?"), p.get("port", 0), p.get("relay_to"))
+
+
 def tier(level: float) -> tuple[str, str]:
     for floor, name, icon in TIERS:
         if level >= floor:
@@ -50,7 +56,10 @@ class FriendBook:
         atomic_write(self.path, json.dumps(self.peers, indent=1, ensure_ascii=False))
 
     # ---- updates (each reloads first: chat and the node share this file) ----
-    def seen(self, profile: dict, host: str, source: str, first_level: float = 0.0) -> dict | None:
+    def seen(self, profile: dict, host: str, source: str, first_level: float = 0.0,
+             port: int | None = None, relay_to: str | None = None) -> dict | None:
+        """Record that we met her. (host, port) is how to reach her — her own port, or a relay's
+        port when relay_to is set."""
         pub = profile.get("pub")
         if not isinstance(pub, str) or len(pub) != 64:
             return None
@@ -59,7 +68,8 @@ class FriendBook:
         p.update({
             "name": str(profile.get("name", "?"))[:24],
             "host": host,
-            "port": int(profile.get("port", 0)),
+            "port": int(port if port is not None else profile.get("port", 0)),
+            "relay_to": relay_to,
             "tagline": str(profile.get("tagline", ""))[:140],
             "last_seen": time.time(),
         })
@@ -102,7 +112,8 @@ class FriendBook:
         self.reload()
         w = who.strip().lower()
         for pub, p in self.peers.items():
-            if p.get("name", "").lower() == w or pub.startswith(w) or f"{p.get('host')}:{p.get('port')}" == w:
+            if p.get("name", "").lower() == w or pub.startswith(w) or addr_of(p).lower() == w \
+                    or f"{p.get('host')}:{p.get('port')}" == w:
                 return pub, p
         return None
 
@@ -124,7 +135,7 @@ class FriendBook:
         rows = []
         for pub, p in self.ranked()[:limit]:
             t, icon = tier(p.get("level", 0))
-            line = f"- {icon} {p.get('name')} ({t}, {p.get('level', 0):.0f}/100) at {p.get('host')}:{p.get('port')}"
+            line = f"- {icon} {p.get('name')} ({t}, {p.get('level', 0):.0f}/100)"
             if p.get("tagline"):
                 line += f" — “{p['tagline']}”"
             if p.get("feeling"):
@@ -137,6 +148,6 @@ class FriendBook:
         out = []
         for pub, p in self.ranked():
             if p.get("level", 0) >= 35:
-                out.append({"pub": pub, "name": p.get("name"), "host": p.get("host"),
-                            "port": p.get("port"), "tier": tier(p["level"])[0]})
+                out.append({"pub": pub, "name": p.get("name"), "host": p.get("host"), "port": p.get("port"),
+                            "relay_to": p.get("relay_to"), "tier": tier(p["level"])[0]})
         return out

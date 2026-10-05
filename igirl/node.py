@@ -22,7 +22,7 @@ import time
 from collections import deque
 from datetime import datetime
 
-from . import agent, persona, protocol, site
+from . import agent, persona, protocol, relay, site
 from . import tools as T
 from .config import DISCOVERY_PORT, Girl, load_config, list_girls
 from .friends import tier
@@ -54,6 +54,9 @@ class Node:
         self.social = persona.social_factor(girl.persona)
         self.warmth = persona.effect(girl.persona, "stranger_warmth", 0.7)
         self._llm: LLM | None = None
+        self.server: protocol.Server | None = None
+        self.relay_task: asyncio.Task | None = None
+        self.relay_addr: str | None = None
         self._llm_mtime = 0.0
 
     # ---- utils -----------------------------------------------------------------------
@@ -80,14 +83,15 @@ class Node:
             self.solo_runs.popleft()
         return len(self.solo_runs) < self.girl.solo_turns_per_hour
 
-    def meet(self, prof: dict, host: str, source: str) -> None:
+    def meet(self, prof: dict, host: str, port: int, source: str, relay_to: str | None = None) -> None:
         if not prof.get("pub") or prof["pub"] == self.me.identity.pub:
             return
         is_new = prof["pub"] not in self.me.friends.peers
-        self.me.friends.seen(prof, host, source, self.me.first_level)
+        self.me.friends.seen(prof, host, source, self.me.first_level, port=port, relay_to=relay_to)
         if is_new:
             self.met_since_heartbeat.append(f"{prof.get('name')} ({prof.get('tagline', '')}) via {source}")
-            self.log(f"👋 met {prof.get('name')} at {host}:{prof.get('port')} via {source}")
+            where = f"via relay {host}:{port}" if relay_to else f"at {host}:{port}"
+            self.log(f"👋 met {prof.get('name')} {where} ({source})")
 
     # ---- server handlers ---------------------------------------------------------------
     async def h_hello(self, req, host):
@@ -102,7 +106,7 @@ class Node:
     async def h_peers(self, req, host):
         week = time.time() - 7 * 86400
         return {"peers": [{"pub": pub, "name": p.get("name"), "host": p.get("host"), "port": p.get("port"),
-                           "tagline": p.get("tagline", "")}
+                           "relay_to": p.get("relay_to"), "tagline": p.get("tagline", "")}
                           for pub, p in self.me.friends.ranked() if p.get("last_seen", 0) > week][:50]}
 
     async def h_friends(self, req, host):
@@ -123,7 +127,7 @@ class Node:
             raise protocol.GossipError("slow down, babe")
         prof = await protocol.verify_signed(req, "WHISPER", host)
         q.append(now)
-        self.meet(prof, host, "whisper")
+        self.meet(prof, prof["host"], prof["port"], "whisper", prof.get("relay_to"))
         self.me.log_whisper("in", pub, prof.get("name", "?"), text)
         self.me.friends.bump(pub, 1.0, talked=True)
         self.log(f"💌 {prof.get('name')}: {text[:160]}")
@@ -252,16 +256,42 @@ class Node:
                 self.log(f"⚠️ heartbeat failed: {e!r}")
 
     # ---- discovery ----------------------------------------------------------------------------
-    async def hello(self, host: str, port: int, source: str) -> dict | None:
+    async def hello(self, host: str, port: int, source: str, relay_to: str | None = None) -> dict | None:
         try:
-            r = await protocol.request(host, port, {"verb": "HELLO"}, timeout=4)
+            r = await protocol.request(host, port, {"verb": "HELLO"}, timeout=8 if relay_to else 4,
+                                       relay_to=relay_to)
         except protocol.GossipError:
             return None
         prof = r.get("profile", {})
         if prof.get("kind") == "index":
             return prof
-        self.meet(prof, host, source)
+        self.meet(prof, host, port, source, relay_to)
         return prof
+
+    async def hello_entry(self, p: dict, source: str, via: tuple[str, int] | None = None) -> None:
+        """HELLO someone from a PEERS list. Relayed girls an index lists without a host are reached via that index."""
+        relay_to = p.get("relay_to")
+        host, port = p.get("host"), p.get("port")
+        if relay_to and not host and via:
+            host, port = via
+        if host and port:
+            await self.hello(host, int(port), source, relay_to)
+
+    def set_relay(self, addr: str | None) -> None:
+        self.me.relay = addr
+        state = self.girl.path("relay.json")
+        if addr:
+            state.write_text(json.dumps({"relay": addr, "pid": os.getpid()}))
+            self.log(f"🛰️ reachable through relay {addr} (no port forwarding needed)")
+        else:
+            state.unlink(missing_ok=True)
+
+    def want_relay(self, addr: str, why: str) -> None:
+        if self.relay_task is None or self.relay_task.done():
+            self.log(f"🛰️ {why} — opening a relay link to {addr}")
+            self.relay_task = asyncio.get_running_loop().create_task(relay.hold_link(
+                addr, self.me.identity, self.me.profile, self.server.dispatch, self.set_relay, self.log))
+            self.relay_addr = addr
 
     async def sweep(self) -> None:
         cfg = load_config()
@@ -269,19 +299,32 @@ class Node:
             if g.name != self.girl.name and g.pid():
                 await self.hello("127.0.0.1", g.port, "neighbor")
         for addr in cfg.get("peers", []):
-            host, port = protocol.parse_addr(addr)
-            await self.hello(host, port, "manual peer")
+            relay_to, host, port = protocol.split_addr(addr)
+            await self.hello(host, port, "manual peer", relay_to)
+        mode = cfg.get("relay", "auto")  # auto | always | off
         for addr in cfg.get("indexes", []):
             host, port = protocol.parse_addr(addr, 7700)
             try:
-                await protocol.request(host, port, protocol.signed(self.me.identity, self.me.profile(), "ANNOUNCE"))
+                if self.relay_addr == addr and self.relay_task and not self.relay_task.done():
+                    pass  # her relay link already lists her there
+                elif mode == "always":
+                    self.want_relay(addr, "relay mode is 'always'")
+                else:
+                    try:
+                        await protocol.request(host, port, protocol.signed(self.me.identity, self.me.profile(),
+                                                                           "ANNOUNCE"), timeout=15)
+                    except protocol.GossipError as e:
+                        if mode == "auto" and "reach you back" in str(e):
+                            self.want_relay(addr, f"{addr} can't reach this machine directly")
+                        else:
+                            raise
                 peers = (await protocol.request(host, port, {"verb": "PEERS"})).get("peers", [])
             except protocol.GossipError as e:
                 self.log(f"⚠️ index {addr}: {e}")
                 continue
             for p in peers[:40]:
                 if p.get("pub") != self.me.identity.pub and p.get("pub") not in self.me.friends.peers:
-                    await self.hello(p["host"], int(p["port"]), f"index {addr}")
+                    await self.hello_entry(p, f"index {addr}", via=(host, port))
 
     async def exchange_peers(self) -> None:
         """Gossip about gossip: ask a friend who she knows."""
@@ -290,12 +333,13 @@ class Node:
             return
         pub, p = pick
         try:
-            peers = (await protocol.request(p["host"], int(p["port"]), {"verb": "PEERS"}, timeout=4)).get("peers", [])
+            peers = (await protocol.request(p["host"], int(p["port"]), {"verb": "PEERS"}, timeout=8,
+                                            relay_to=p.get("relay_to"))).get("peers", [])
         except protocol.GossipError:
             return
         new = [x for x in peers if x.get("pub") not in self.me.friends.peers and x.get("pub") != self.me.identity.pub]
         for x in new[:5]:
-            await self.hello(x["host"], int(x["port"]), f"{p.get('name')}'s friend")
+            await self.hello_entry(x, f"{p.get('name')}'s friend")
 
     async def sweep_loop(self) -> None:
         while True:
@@ -339,7 +383,8 @@ class Node:
     async def serve(self) -> None:
         handlers = {"HELLO": self.h_hello, "LIST": self.h_list, "FETCH": self.h_fetch,
                     "PEERS": self.h_peers, "FRIENDS": self.h_friends, "WHISPER": self.h_whisper}
-        server = await asyncio.start_server(protocol.Server(handlers, self.log).handle, "0.0.0.0", self.girl.port)
+        self.server = protocol.Server(handlers, self.log)
+        server = await asyncio.start_server(self.server.handle, "0.0.0.0", self.girl.port)
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGUSR1, self.wake.set)
         stop = asyncio.Event()
@@ -356,8 +401,9 @@ class Node:
             tasks.append(loop.create_task(self._guard(self.lan_loop(), "LAN discovery")))
         async with server:
             await stop.wait()
-        for t in tasks:
+        for t in tasks + ([self.relay_task] if self.relay_task else []):
             t.cancel()
+        self.set_relay(None)
         self.log(f"💤 {self.girl.name} went offline")
 
     async def _guard(self, coro, what):

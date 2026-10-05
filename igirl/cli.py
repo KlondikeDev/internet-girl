@@ -259,7 +259,7 @@ def cmd_index(a):
     if a.action == "serve":
         from .index import run
         try:
-            asyncio.run(run(a.port, a.state, a.title))
+            asyncio.run(run(a.port, a.state, a.title, a.public_addr))
         except KeyboardInterrupt:
             pass
         return
@@ -300,7 +300,9 @@ def main(argv=None):
     p = sp.add_parser("index", help="index nodes: add/rm/ls host:port, or `serve` one")
     p.add_argument("action", choices=["add", "rm", "ls", "serve"]); p.add_argument("addr", nargs="?")
     p.add_argument("--port", type=int, default=INDEX_PORT); p.add_argument("--state", default="index.json")
-    p.add_argument("--title", default="Gossip Index"); p.set_defaults(fn=cmd_index)
+    p.add_argument("--title", default="Gossip Index")
+    p.add_argument("--public-addr", help="host:port people use to reach this index (needed to relay girls behind NAT)")
+    p.set_defaults(fn=cmd_index)
 
     a = ap.parse_args(argv)
     if a.cmd not in ("install", "index") and not is_installed():

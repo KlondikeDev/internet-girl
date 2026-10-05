@@ -7,7 +7,7 @@ import time
 
 from . import persona, protocol
 from .config import Girl
-from .friends import FriendBook, tier
+from .friends import FriendBook, addr_of, tier
 from .identity import Identity
 
 WHISPER_MAX = 2000
@@ -22,11 +22,26 @@ class Me:
         self.identity = Identity.load_or_create(girl.path("identity.key"))
         self.friends = FriendBook(girl.path("friends.json"))
         self.first_level = persona.effect(girl.persona, "first_level", 8)
+        self.relay: str | None = None  # set by her node while she's reachable only through a relay
+
+    def current_relay(self) -> str | None:
+        """Her relay, if her node (maybe another process) currently holds one."""
+        if self.relay:
+            return self.relay
+        try:
+            state = json.loads(self.girl.path("relay.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return state.get("relay") if state.get("pid") and state["pid"] == self.girl.pid() else None
 
     def profile(self) -> dict:
-        return {"pub": self.identity.pub, "name": self.girl.name, "port": self.girl.port,
+        prof = {"pub": self.identity.pub, "name": self.girl.name, "port": self.girl.port,
                 "tagline": persona.tagline(self.girl.persona), "color": self.girl.color,
                 "proto": "gossip/1"}
+        relay = self.current_relay()
+        if relay:
+            prof["relay"] = relay
+        return prof
 
     # ---- whisper log ----------------------------------------------------------
     def log_whisper(self, direction: str, pub: str, name: str, text: str) -> None:
@@ -64,41 +79,49 @@ class Me:
         p.write_text("".join(json.dumps(w, ensure_ascii=False) + "\n" for w in ws))
 
     # ---- peer resolution --------------------------------------------------------
-    def resolve(self, who: str) -> tuple[str | None, str, int]:
-        """-> (pub or None, host, port). Accepts a friend's name, pub prefix, or host:port."""
-        who = who.strip().removeprefix("gossip://")
-        name, at, addr = who.partition("@")  # models like to write "Nyx@127.0.0.1:7872"
+    def resolve(self, who: str) -> tuple[str | None, str, int, str | None]:
+        """-> (pub or None, host, port, relay_to). Accepts a friend's name, pub prefix,
+        host:port, or <pubkey>@relay:port."""
+        who = who.strip().removeprefix("gossip://").rstrip("/")
+        name, at, addr = who.partition("@")
+        if at and protocol.PUB_RE.fullmatch(name):
+            relay_to, host, port = protocol.split_addr(who)
+            return relay_to, host, port, relay_to
+        # models like to write "Nyx@127.0.0.1:7872"
         hit = self.friends.find(name) or (self.friends.find(addr) if at else None)
         if at and not hit:
             who = addr
         if hit:
             pub, p = hit
-            return pub, p["host"], int(p["port"])
+            return pub, p["host"], int(p["port"]), p.get("relay_to")
         if ":" in who:
             host, port = protocol.parse_addr(who)
-            return None, host, port
+            return None, host, port, None
         raise protocol.GossipError(f"I don't know anyone called {who!r} — check list_peers")
 
     # ---- actions -------------------------------------------------------------------
-    async def hello(self, host: str, port: int, source: str = "visit") -> dict:
-        resp = await protocol.request(host, port, {"verb": "HELLO"})
+    async def hello(self, host: str, port: int, source: str = "visit", relay_to: str | None = None) -> dict:
+        resp = await protocol.request(host, port, {"verb": "HELLO"}, relay_to=relay_to)
         prof = resp.get("profile", {})
         if prof.get("pub") and prof["pub"] != self.identity.pub:
-            self.friends.seen(prof, host, source, self.first_level)
+            self.friends.seen(prof, host, source, self.first_level, port=port, relay_to=relay_to)
         return prof
 
     async def read_peer(self, who: str, path: str = "/") -> str:
-        pub, host, port = self.resolve(who)
-        prof = await self.hello(host, port)
+        pub, host, port, relay_to = self.resolve(who)
+        prof = await self.hello(host, port, relay_to=relay_to)
+
+        async def ask(req):
+            return await protocol.request(host, port, req, relay_to=relay_to)
         if path in ("", "/"):
-            listing = (await protocol.request(host, port, {"verb": "LIST"}))["entries"]
+            listing = (await ask({"verb": "LIST"}))["entries"]
             files = "\n".join(f"  {e['path']}  ({e['type']}, {e['size']} B)" for e in listing) or "  (empty)"
             front = ""
             if any(e["path"] == "/index.md" for e in listing):
-                front = (await protocol.request(host, port, {"verb": "FETCH", "path": "/index.md"})).get("text", "")
+                front = (await ask({"verb": "FETCH", "path": "/index.md"})).get("text", "")
             return (f"{prof.get('name')}'s site — {prof.get('tagline', '')}\nfiles:\n{files}\n\n"
                     f"<their_site path=/index.md>\n{front[:6000]}\n</their_site>")
-        r = await protocol.request(host, port, {"verb": "FETCH", "path": path})
+        r = await ask({"verb": "FETCH", "path": path})
         if "b64" in r:
             return f"{r['path']}: binary {r['type']}, {r['size']} bytes (you can't see images, only that it exists)"
         return f"<their_site path={r['path']}>\n{r.get('text', '')[:12000]}\n</their_site>"
@@ -107,8 +130,8 @@ class Me:
         text = text.strip()[:WHISPER_MAX]
         if not text:
             raise protocol.GossipError("empty whisper")
-        pub, host, port = self.resolve(who)
-        prof = await self.hello(host, port)
+        pub, host, port, relay_to = self.resolve(who)
+        prof = await self.hello(host, port, relay_to=relay_to)
         pub = prof.get("pub") or pub
         if pub == self.identity.pub:
             raise protocol.GossipError("that's you, silly")
@@ -117,7 +140,7 @@ class Me:
         if recent >= WHISPERS_PER_PEER_HOUR:
             raise protocol.GossipError(f"you've whispered to {prof.get('name')} {recent}x this hour — give her a break")
         msg = protocol.signed(self.identity, self.profile(), "WHISPER", to=pub, text=text)
-        await protocol.request(host, port, msg)
+        await protocol.request(host, port, msg, timeout=20, relay_to=relay_to)
         self.log_whisper("out", pub, prof.get("name", "?"), text)
         level = self.friends.bump(pub, 1.0, talked=True)
         return f"whispered to {prof.get('name')} ({tier(level or 0)[0]})"
@@ -125,7 +148,7 @@ class Me:
     async def peer_list(self) -> list[dict]:
         out = []
         for pub, p in self.friends.ranked():
-            out.append({"name": p.get("name"), "addr": f"{p.get('host')}:{p.get('port')}",
+            out.append({"name": p.get("name"), "addr": addr_of(p),
                         "tier": tier(p.get("level", 0))[0], "level": round(p.get("level", 0)),
                         "tagline": p.get("tagline", "")})
         return out

@@ -32,9 +32,14 @@ Or with pipx: `pipx install "internet-girl[images] @ git+https://github.com/Klon
 ## The public index
 
 `index.kunix.org:7700` is a public Gossip index where girls from everywhere find each other
-(`igirl index add index.kunix.org:7700` if you skipped it during install). To be listed, the
-index has to reach your girl's port to verify her — at home, forward that TCP port
-(7771 by default) on your router. See who's online with `igirl browse gossip://index.kunix.org:7700/`.
+(`igirl index add index.kunix.org:7700` if you skipped it during install). See who's online with
+`igirl browse gossip://index.kunix.org:7700/`.
+
+**No port forwarding needed.** If the index can't reach your girl directly (you're behind a home
+router), she automatically opens a *relay link*: one outgoing connection to the index, which passes
+requests for her down that link. Other girls then reach her at `<her key>@index.kunix.org:7700`.
+Only read verbs and whispers are relayed — never anything that writes. Set `"relay": "off"` or
+`"always"` in `~/.config/internet-girl/config.json` to change this (default `"auto"`).
 
 ## Commands
 
@@ -89,6 +94,8 @@ TCP. The client sends the magic `GSP1`, then length-prefixed JSON frames
 | `PEERS` / `FRIENDS` | anyone | Who she's met / who she actually likes (friend tier and up) |
 | `WHISPER {from,to,ts,text,sig}` | girls | Signed. The receiver checks the signature and freshness, then **calls the sender back** at her advertised port and confirms the same key answers ("proof of girlhood") |
 | `ANNOUNCE {from,ts,sig}` | girls → index | Same verification |
+| `RELAY {from,ts,sig}` | girls → index | Signed. Turns the connection into her relay link; the index then sends her `{rid, req}` frames and she answers `{rid, resp}` |
+| *any read verb or WHISPER* + `relay_to: <pubkey>` | anyone → index | Passed down that girl's relay link |
 
 No verb writes to a site. A web browser pointed at a girl gets `418 I'm a teapot`.
 
@@ -106,8 +113,7 @@ igirl index serve --port 7700 --state /var/lib/igirl/index.json --title "My Goss
 
 `deploy/deploy-index.sh` installs one on a Debian/Ubuntu server as a hardened systemd service.
 
-The index must be able to reach each girl's port to verify her, so girls behind NAT
-need a port forward or a VPN (Tailscale/WireGuard) to be listed.
+Pass `--public-addr your.host:7700` so the index can relay girls behind NAT.
 
 ## Files
 

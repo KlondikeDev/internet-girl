@@ -15,7 +15,7 @@ from rich.table import Table
 
 from . import protocol
 from .config import Girl, list_girls
-from .friends import FriendBook
+from .friends import FriendBook, addr_of
 
 PAGE_WIDTH = 100  # sites read like pages, not like the full width of a 280-column terminal
 console = Console()
@@ -32,7 +32,7 @@ def resolve_target(target: str) -> tuple[str, str, Girl | None]:
     for g in list_girls():
         hit = FriendBook(g.path("friends.json")).find(target)
         if hit:
-            return f"{hit[1]['host']}:{hit[1]['port']}", hit[1]["name"], None
+            return addr_of(hit[1]), hit[1]["name"], None
     raise SystemExit(f"Don't know {target!r}. Use a local girl's name, a name one of them has met, or host:port.")
 
 

@@ -23,7 +23,7 @@ from textual.widgets import Footer, Input, Markdown, Static, Tree
 
 from .. import protocol
 from ..config import load_config, list_girls
-from ..friends import FriendBook, tier
+from ..friends import FriendBook, addr_of, tier
 from ..reader import _local
 
 IMAGE_MAX_BYTES = 3 * 1024 * 1024
@@ -79,7 +79,7 @@ def parse(text: str, base: Loc | None) -> Loc | None:
     for g in list_girls():
         hit = FriendBook(g.path("friends.json")).find(t)
         if hit:
-            return Loc(fmt_addr(hit[1]["host"], hit[1]["port"]), "/", view)
+            return Loc(addr_of(hit[1]), "/", view)
     raise ValueError(f"don't know anyone called {t!r}")
 
 
@@ -187,7 +187,7 @@ class Browser(App):
                 rows.append(p)
         for p in sorted(rows, key=lambda p: -p.get("level", 0)):
             icon = tier(p.get("level", 0))[1]
-            met.add_leaf(f"{icon} {escape(p.get('name', '?'))}", data=Loc(fmt_addr(p["host"], p["port"])))
+            met.add_leaf(f"{icon} {escape(p.get('name', '?'))}", data=Loc(addr_of(p)))
         if not rows:
             met.add_leaf("[dim](nobody yet)[/]")
 
@@ -243,13 +243,21 @@ class Browser(App):
         if self.pos >= 0:
             self.go(self.history[self.pos], push=False)
 
+    @staticmethod
+    def link(p: dict, via: Loc) -> str:
+        """A PEERS/FRIENDS entry as a gossip:// link; relayed girls without a host go through `via`."""
+        host, port = p.get("host"), p.get("port")
+        if p.get("relay_to") and not host:
+            _, host, port = protocol.split_addr(via.addr)
+        return f"gossip://{protocol.join_addr(host, port, p.get('relay_to'))}/"
+
     # ---- fetching -------------------------------------------------------------------------------
     async def ask(self, loc: Loc, req: dict, offline: list) -> dict:
         if offline:
             return _local(self.locals[loc.addr])(req)
-        host, port = protocol.parse_addr(loc.addr)
+        relay_to, host, port = protocol.split_addr(loc.addr)
         try:
-            return await protocol.request(host, port, req)
+            return await protocol.request(host, port, req, timeout=15 if relay_to else 8, relay_to=relay_to)
         except protocol.GossipError:
             girl = self.locals.get(loc.addr)
             if girl is None or req["verb"] != "HELLO":
@@ -277,7 +285,7 @@ class Browser(App):
 
             if prof.get("kind") == "index":
                 peers = (await self.ask(loc, {"verb": "PEERS"}, offline)).get("peers", [])
-                rows = "\n".join(f"- [**{p['name']}**]({'gossip://' + fmt_addr(p['host'], p['port'])}/) — {p.get('tagline', '')}"
+                rows = "\n".join(f"- [**{p['name']}**]({self.link(p, loc)}) — {p.get('tagline', '')}"
                                  for p in peers) or "*(nobody online right now)*"
                 await doc.update(f"## 📇 girls on this index\n\n{rows}\n")
                 return
@@ -285,7 +293,7 @@ class Browser(App):
             nav = f"[🏠 home]({here}/) · [💕 friends]({here}/?friends) · [🌐 peers]({here}/?peers)"
             if loc.view in ("friends", "peers"):
                 rows = (await self.ask(loc, {"verb": loc.view.upper()}, offline)).get(loc.view, [])
-                lines = [f"- [**{r.get('name')}**](gossip://{fmt_addr(r.get('host'), r.get('port'))}/)"
+                lines = [f"- [**{r.get('name')}**]({self.link(r, loc)})"
                          + (f" — {r['tier']}" if r.get("tier") else f" — {r.get('tagline', '')}") for r in rows]
                 title = "her friends" if loc.view == "friends" else "girls she's met"
                 await doc.update(f"{nav}\n\n## {title}\n\n" + ("\n".join(lines) or "*(nobody yet)*"))

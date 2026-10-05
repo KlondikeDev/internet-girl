@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/opt/internet-girl/.venv/bin/igirl index serve --port 7700 --state /var/lib/igirl/index.json --title "kunix.org Gossip Index"
+ExecStart=/opt/internet-girl/.venv/bin/igirl index serve --port 7700 --state /var/lib/igirl/index.json --title "kunix.org Gossip Index" --public-addr index.kunix.org:7700
 DynamicUser=yes
 StateDirectory=igirl
 Environment=IGIRL_CONFIG_DIR=/var/lib/igirl/config

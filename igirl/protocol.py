@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import struct
 import time
 
@@ -66,6 +67,24 @@ def parse_addr(addr: str, default_port: int = 7771) -> tuple[str, int]:
     return addr, default_port
 
 
+PUB_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def split_addr(addr: str, default_port: int = 7771) -> tuple[str | None, str, int]:
+    """'host:port' -> (None, host, port);  '<pubkey>@relayhost:port' -> (pubkey, relayhost, port)."""
+    relay_to = None
+    key, at, rest = addr.strip().partition("@")
+    if at and PUB_RE.fullmatch(key):
+        relay_to, addr = key, rest
+    host, port = parse_addr(addr, default_port)
+    return relay_to, host, port
+
+
+def join_addr(host: str, port: int, relay_to: str | None = None) -> str:
+    hp = f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+    return f"{relay_to}@{hp}" if relay_to else hp
+
+
 async def send_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
     data = json.dumps(obj, ensure_ascii=False).encode()
     if len(data) > MAX_FRAME:
@@ -88,8 +107,11 @@ async def recv_frame(reader: asyncio.StreamReader) -> dict | None:
     return obj
 
 
-async def request(host: str, port: int, req: dict, timeout: float = TIMEOUT) -> dict:
-    """One request, one response. Raises GossipError on transport or protocol errors."""
+async def request(host: str, port: int, req: dict, timeout: float = TIMEOUT, relay_to: str | None = None) -> dict:
+    """One request, one response. Raises GossipError on transport or protocol errors.
+    With relay_to, (host, port) is a relay and the request is passed on to the girl with that key."""
+    if relay_to:
+        req = {**req, "relay_to": relay_to}
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
     except (OSError, asyncio.TimeoutError) as e:
@@ -109,9 +131,13 @@ async def request(host: str, port: int, req: dict, timeout: float = TIMEOUT) -> 
     return resp
 
 
+async def request_addr(addr: str, req: dict, timeout: float = TIMEOUT) -> dict:
+    relay_to, host, port = split_addr(addr)
+    return await request(host, port, req, timeout, relay_to)
+
+
 def request_sync(addr: str, req: dict, timeout: float = TIMEOUT) -> dict:
-    host, port = parse_addr(addr)
-    return asyncio.run(request(host, port, req, timeout))
+    return asyncio.run(request_addr(addr, req, timeout))
 
 
 def signed(identity, profile_from: dict, verb: str, **fields) -> dict:
@@ -132,9 +158,10 @@ class Server:
     MAX_PER_IP = 16       # concurrent connections from one address
     MAX_TOTAL = 512
 
-    def __init__(self, handlers: dict, log=print):
+    def __init__(self, handlers: dict, log=print, forward=None):
         self.handlers = handlers
         self.log = log
+        self.forward = forward  # async fn(request, peer_host) -> dict, for requests carrying relay_to
         self.active: dict[str, int] = {}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -163,29 +190,42 @@ class Server:
                 req = await asyncio.wait_for(recv_frame(reader), 60)
                 if req is None:
                     return
-                fn = self.handlers.get(str(req.get("verb", "")).upper())
-                if fn is None:
-                    resp = {"ok": False, "error": f"unknown verb {req.get('verb')!r}"}
-                else:
-                    try:
-                        resp = await fn(req, peer_host)
-                        resp.setdefault("ok", True)
-                    except GossipError as e:
-                        resp = {"ok": False, "error": str(e)}
-                    except Exception as e:  # never let one bad request kill the node
-                        self.log(f"handler error on {req.get('verb')}: {e!r}")
-                        resp = {"ok": False, "error": "internal error"}
+                resp = await self.dispatch(req, peer_host)
+                takeover = resp.pop("_takeover", None)
                 await send_frame(writer, resp)
+                if takeover:  # e.g. a girl turning this connection into her relay link
+                    await takeover(reader, writer)
+                    return
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, GossipError,
                 json.JSONDecodeError, UnicodeDecodeError):
             pass
         finally:
             writer.close()
 
+    async def dispatch(self, req: dict, peer_host: str) -> dict:
+        if "relay_to" in req:
+            fn = self.forward
+            if fn is None:
+                return {"ok": False, "error": "this node doesn't relay"}
+        else:
+            fn = self.handlers.get(str(req.get("verb", "")).upper())
+            if fn is None:
+                return {"ok": False, "error": f"unknown verb {req.get('verb')!r}"}
+        try:
+            resp = await fn(req, peer_host)
+            resp.setdefault("ok", True)
+            return resp
+        except GossipError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # never let one bad request kill the node
+            self.log(f"handler error on {req.get('verb')}: {e!r}")
+            return {"ok": False, "error": "internal error"}
 
-async def verify_signed(req: dict, expect_verb: str, peer_host: str) -> dict:
-    """Check signature, freshness, and that a girl with this key really lives at the claimed port.
-    Returns the verified sender profile (with "host" filled in)."""
+
+async def verify_signed(req: dict, expect_verb: str, peer_host: str, callback: bool = True) -> dict:
+    """Check signature and freshness, then (callback=True) that a girl with this key is really reachable:
+    at her port on the address she connected from, or through the relay she says she lives behind.
+    Returns her verified profile with "host", "port" and "relay_to" set to how to reach her."""
     from .identity import verify
 
     frm = req.get("from")
@@ -193,8 +233,22 @@ async def verify_signed(req: dict, expect_verb: str, peer_host: str) -> dict:
         raise GossipError("missing sender")
     if abs(time.time() - int(req.get("ts", 0))) > SIG_WINDOW:
         raise GossipError("stale message")
+    if req.get("verb") != expect_verb:
+        raise GossipError("wrong verb")
     if not verify(frm["pub"], canonical(req), str(req.get("sig", ""))):
         raise GossipError("bad signature")
+    if not callback:
+        return {**frm, "host": peer_host, "relay_to": None}
+    if isinstance(frm.get("relay"), str):
+        rhost, rport = parse_addr(frm["relay"], 7700)
+        try:
+            hello = await request(rhost, rport, {"verb": "HELLO"}, timeout=8, relay_to=frm["pub"])
+        except GossipError as e:
+            raise GossipError(f"couldn't reach you through your relay {frm['relay']}: {e}") from None
+        prof = hello.get("profile", {})
+        if prof.get("pub") != frm["pub"]:
+            raise GossipError("callback key mismatch")
+        return {**prof, "host": rhost, "port": rport, "relay_to": frm["pub"]}
     try:
         port = int(frm.get("port"))
     except (TypeError, ValueError):
@@ -208,5 +262,4 @@ async def verify_signed(req: dict, expect_verb: str, peer_host: str) -> dict:
     prof = hello.get("profile", {})
     if prof.get("pub") != frm["pub"]:
         raise GossipError("callback key mismatch")
-    prof["host"] = peer_host
-    return prof
+    return {**prof, "host": peer_host, "port": port, "relay_to": None}
