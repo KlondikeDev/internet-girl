@@ -22,9 +22,17 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CONFIG_DIR = Path(os.environ.get("IGIRL_CONFIG_DIR", Path.home() / ".config" / "internet-girl"))
+def _home() -> Path:
+    # Services running as a DynamicUser have no home directory; don't crash at import.
+    try:
+        return Path.home()
+    except RuntimeError:
+        return Path(os.environ.get("STATE_DIRECTORY", "/tmp"))
+
+
+CONFIG_DIR = Path(os.environ.get("IGIRL_CONFIG_DIR") or _home() / ".config" / "internet-girl")
 CONFIG_PATH = CONFIG_DIR / "config.json"
-DEFAULT_HOME = Path.home() / ".local" / "share" / "internet-girls"
+DEFAULT_HOME = _home() / ".local" / "share" / "internet-girls"
 
 DISCOVERY_PORT = 7770
 FIRST_GIRL_PORT = 7771

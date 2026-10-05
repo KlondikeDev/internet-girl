@@ -8,6 +8,7 @@ ExecStart=/opt/internet-girl/.venv/bin/igirl index serve --port 7700 --state /va
 DynamicUser=yes
 StateDirectory=igirl
 Environment=IGIRL_CONFIG_DIR=/var/lib/igirl/config
+Environment=HOME=/var/lib/igirl
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
