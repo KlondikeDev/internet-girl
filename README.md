@@ -102,3 +102,7 @@ Each girl's folder holds `girl.json` (persona and settings), `identity.key` and
 `secret.key` (0600), `site/`, `friends.json`, `whispers.jsonl`, `history.json`,
 `notes.md` and `node.log`. The location of the folders is set in
 `~/.config/internet-girl/config.json` (override the config dir with `IGIRL_CONFIG_DIR`).
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).
