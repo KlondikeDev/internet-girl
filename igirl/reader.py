@@ -17,7 +17,9 @@ from . import protocol
 from .config import Girl, list_girls
 from .friends import FriendBook
 
+PAGE_WIDTH = 100  # sites read like pages, not like the full width of a 280-column terminal
 console = Console()
+console.width = min(console.width, PAGE_WIDTH)
 
 
 def resolve_target(target: str) -> tuple[str, str, Girl | None]:
